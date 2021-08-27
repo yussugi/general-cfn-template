@@ -1,0 +1,290 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: CloudWatch resources template
+
+Parameters:
+  Email:
+    Type: String
+    Description: Slack E-Mail Address
+    Default: sample@example.com
+  ApiName:
+    Type: String
+    Description: Api Name
+    Default: api
+  StageName:
+    Type: String
+    Description: Api Stage Name
+    Default: stage
+  WafId:
+    Type: String
+    Description: Waf Id for CloudFront
+    Default: __WAFID__
+  WafRegionalId:
+    Type: String
+    Description: Waf Id for APIGateway
+    Default: __WAFREGIONALID__
+
+Resources:
+  AlarmForSlackSnsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: LogMonitor-Slack-Notification
+      DisplayName: LogMonitor-Slack-Notification
+      Subscription:
+        - Endpoint: !Ref Email
+          Protocol: email
+
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: LogAlertforSNS
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from botocore.exceptions import ClientError
+          import datetime
+          import os
+
+          print('Loading function')
+
+          def lambda_handler(event, context):
+
+            SNS_TOPIC_ARN = os.environ['SNS_TOPIC_ARN']
+
+            try:
+                message_orig = event['Records'][0]['Sns']['Message']
+                message = json.loads(message_orig)
+
+                logs = boto3.client('logs')
+                sns = boto3.client('sns')
+
+                metricfilters = logs.describe_metric_filters(
+                    metricName = message['Trigger']['MetricName'] ,
+                    metricNamespace = message['Trigger']['Namespace']
+                )
+
+                intPeriod = message['Trigger']['Period'] * 2 + 10
+
+                strEndTime = datetime.datetime.strptime(message['StateChangeTime'], '%Y-%m-%dT%H:%M:%S.%f%z')
+                strStartTime = strEndTime - datetime.timedelta(seconds = intPeriod)
+                alarmEndTime = int(strEndTime.timestamp()) * 1000
+                alarmStartTime = int(strStartTime.timestamp()) * 1000
+
+                response = logs.filter_log_events(
+                    logGroupName = metricfilters['metricFilters'][0]['logGroupName'],
+                    startTime = alarmStartTime,
+                    endTime = alarmEndTime,
+                    filterPattern = metricfilters['metricFilters'][0]['filterPattern'],
+                    limit = 10
+                )
+
+                for i in range(len(response['events'])):
+                    alarm_name = message['AlarmName']
+                    new_state = message['NewStateValue']
+                    reason = response['events'][i]['message']
+
+                    publishResponse = sns.publish(
+                        TopicArn = SNS_TOPIC_ARN,
+                        Message = "state is now %s: %s" % (new_state, reason),
+                        Subject = alarm_name
+                    )
+
+            except Exception as e:
+                print(e)
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Role: !Sub arn:aws:iam::${AWS::AccountId}:role/LambdaExecutionRole
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref AlarmForSlackSnsTopic
+      Runtime: python3.7
+      Timeout: 60
+      Description: An Amazon SNS trigger that logs the message pushed to the SNS topic.
+
+  SNSTopic:
+    DependsOn: LambdaFunction
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: LogMonitorLambda
+      TopicName: LogMonitor-Alarm-Lambda-Notification
+      Subscription:
+        - Endpoint: !Sub ${LambdaFunction.Arn}
+          Protocol: lambda
+
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Sub ${LambdaFunction.Arn}
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref SNSTopic
+
+  ## Error Alart for Lambda Function
+  ## e.g. lambda function name is sample case
+  ConnectFunctionErrorLogMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      ## Filter of free text
+      ## e.g. "ERROR" or "timed out"
+      FilterPattern: '?ERROR ?"timed out"'
+      LogGroupName: /aws/lambda/sample-Function-QH0RZIY50A09
+      MetricTransformations:
+        - MetricValue: 1
+          MetricNamespace: sample-Function-QH0RZIY50A09-ErrorLogMetrics
+          MetricName: sample-Function-QH0RZIY50A09-ErrorLogCount
+          DefaultValue: 0
+
+  ### Monitor Alarm
+  ConnectFunctionErrorLogMonitorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: ErrorLogMonitorAlarm
+      MetricName: sample-Function-QH0RZIY50A09-ErrorLogCount
+      Namespace: sample-Function-QH0RZIY50A09-ErrorLogMetrics
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 1
+      Period: 60
+      Statistic: Maximum
+      Threshold: 1
+      AlarmActions:
+        - !Ref AlarmForSlackSnsTopic
+      # OKActions:
+      #   - !Ref AlarmForSlackSnsTopic
+      TreatMissingData: notBreaching
+      AlarmName: 'pjt-name sample-FunctionErrorLogMonitorAlarm'
+
+  ### Metrics Alarm
+  ConnectFunctionErrorLogMetricsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: ErrorLogMetricsAlarm
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Dimensions:
+        - Name: FunctionName
+          Value: sample-Function-QH0RZIY50A09
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 1
+      Period: 60
+      Statistic: Maximum
+      Threshold: 1
+      AlarmActions:
+        - !Ref AlarmForSlackSnsTopic
+      # OKActions:
+      #  - !Ref AlarmForSlackSnsTopic
+      TreatMissingData: notBreaching
+      AlarmName: 'pjt-name sample-FunctionErrorLogMetricsAlarm'
+
+  ## API Gateway 5XX Errors
+  ErrorAPIGatewayMetricsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: 5XXErrorAPIGatewayMetricsAlarm
+      MetricName: 5XXError
+      Namespace: AWS/ApiGateway
+      Dimensions:
+        - Name: ApiName
+          Value: !Ref ApiName
+        - Name: Stage
+          Value: !Ref StageName
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 1
+      Period: 60
+      Statistic: Maximum
+      Threshold: 1
+      AlarmActions:
+        - !Ref AlarmForSlackSnsTopic
+      # OKActions:
+      #   - !Ref AlarmForSlackSnsTopic
+      TreatMissingData: notBreaching
+      AlarmName: 5XXErrorAPIGatewayMetricsAlarm
+
+  ## DynamoDB Alarm
+  SystemErrorsDynamoDBMetricsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: SystemErrorsDynamoDBMetricsAlarm
+      MetricName: SystemErrors
+      Namespace: AWS/DynamoDB
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 1
+      Period: 60
+      Statistic: Maximum
+      Threshold: 1
+      AlarmActions:
+        - !Ref AlarmForSlackSnsTopic
+      # OKActions:
+      #   - !Ref AlarmForSlackSnsTopic
+      TreatMissingData: notBreaching
+      AlarmName: SystemErrorsDynamoDBMetricsAlarm
+
+  UserErrorsDynamoDBMetricsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: UserErrorsDynamoDBMetricsAlarm
+      MetricName: UserErrors
+      Namespace: AWS/DynamoDB
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 1
+      Period: 60
+      Statistic: Maximum
+      Threshold: 1
+      AlarmActions:
+        - !Ref AlarmForSlackSnsTopic
+      # OKActions:
+      #   - !Ref AlarmForSlackSnsTopic
+      TreatMissingData: notBreaching
+      AlarmName: UserErrorsDynamoDBMetricsAlarm
+
+  ## RDS(Aurora) Alarm
+  CPUUtilizationRDSMetricsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: CPUUtilizationRDSMetricsAlarm
+      MetricName: CPUUtilization
+      Namespace: AWS/RDS
+      Dimensions:
+        - Name: EngineName
+          Value: AuroraMySQL
+        - Name: SourceRegion
+          Value: ap-northeast-1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: 1
+      Period: 900
+      Statistic: Average
+      Threshold: 80
+      AlarmActions:
+        - !Ref AlarmForSlackSnsTopic
+      # OKActions:
+      #   - !Ref AlarmForSlackSnsTopic
+      TreatMissingData: notBreaching
+      AlarmName: CPUUtilizationRDSMetricsAlarm
+
+  FreeStorageSpaceRDSMetricsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: FreeStorageSpaceRDSMetricsAlarm
+      MetricName: FreeStorageSpace
+      Namespace: AWS/RDS
+      Dimensions:
+        - Name: EngineName
+          Value: AuroraMySQL
+        - Name: SourceRegion
+          Value: ap-northeast-1
+      ComparisonOperator: LessThanOrEqualToThreshold
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 1
+      Period: 60
+      Statistic: Maximum
+      Threshold: 10737418240
+      AlarmActions:
+        - !Ref AlarmForSlackSnsTopic
+      # OKActions:
+      #   - !Ref AlarmForSlackSnsTopic
+      TreatMissingData: notBreaching
+      AlarmName: FreeStorageSpaceRDSMetricsAlarm
