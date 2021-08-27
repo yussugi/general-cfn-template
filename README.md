@@ -15,4 +15,11 @@ general template of cloudformation yaml file for me.
       1. build Aurora MySQL Database with VPC(optional bastion)
    2. aurora_mysql.template.yaml
       1. build Aurora MySQL Database using exsiting VPC
-4. SAM(sample api gateway and lambda)
+4. CloudWatch Alarm
+5. SAM(sample api gateway and lambda)
+
+## general VPC
+
+## general Aurora Database(MySQL)
+
+## CloudWatch Alarm
