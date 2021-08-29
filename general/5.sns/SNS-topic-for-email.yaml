@@ -1,0 +1,13 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: SNS template for notify E-mail
+
+Resources:
+  NotifyMailSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: notify-mail-sns-topic
+      Subscription:
+        - Endpoint: hogehoge1@domain
+          Protocol: email
+        - Endpoint: hogehoge2@domain
+          Protocol: email
